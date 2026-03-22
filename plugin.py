@@ -13,6 +13,8 @@ Changes in 0.4.17:
       symmetrically with how ConstC is already learned.
     - Fix: added safety clamp lower bounds: ConstC minimum 1.0, ConstT minimum 0.0.
       Previously only upper bounds were enforced (ConstC max 150, ConstT max 10).
+    - Fix: if ConstT >= 10 (at maximum) and setpoint was reached, force ConstT down by 15% per cycle
+      to recover from diverged state without manual intervention, same logic as ConstC recovery.
 
 Changes in 0.4.16:
     - Added optional valve contact sensor support (7th value in Mode5): when configured, the heat
@@ -617,6 +619,13 @@ class BasePlugin:
             self.Internals['nbCT'] = min(self.Internals['nbCT'] + 1, 50)
             self.WriteLog("ConstT updated to {} (alpha={})".format(
                 self.Internals['ConstT'], round(alpha_T, 3)), "Verbose")
+
+        # [FIX] if ConstT is at maximum and setpoint was reached, ConstT is too high.
+        # Force it down gradually at 15% per cycle, same recovery logic as ConstC divergence.
+        if self.Internals['ConstT'] >= 10.0 and self.intemp >= self.Internals['LastSetPoint']:
+            self.Internals['ConstT'] = round(self.Internals['ConstT'] * 0.85, 1)
+            self.WriteLog("ConstT at maximum and setpoint reached - forcing down to {}".format(
+                self.Internals['ConstT']), "Status")
 
         # [NEW] Safety clamp: ConstC and ConstT must stay within reasonable bounds in both directions.
         # Upper bounds: ConstC > 150 means even 0.5°C error gives 75% power - clearly wrong.
