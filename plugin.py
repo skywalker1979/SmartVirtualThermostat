@@ -4,10 +4,36 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.14 (November 13, 2023) - see history.txt for versions history
+Version: 0.4.16 (March 2026) - see history.txt for versions history
+
+Changes in 0.4.16:
+    - Added optional valve contact sensor support (7th value in Mode5): when configured, the heat
+      timer starts only after the valve contact confirms the valve is open, not when SVT commands
+      the heater switch. If not set or 0, behaviour is unchanged.
+    - Fix: LastSetPoint now updated immediately in memory (and persisted) when setpoint changes,
+      so AutoCallib uses the correct reference on the very next cycle.
+    - Fix: AutoCallib now learns ConstC downward when LastPwr==100 but setpoint was reached/exceeded,
+      breaking the divergence loop that caused ConstC to grow unbounded.
+    - Fix: added safety clamp on ConstC (max 150) and ConstT (max 10) to prevent runaway values.
+    - Fix: if ConstC > 150 and power was 100% but setpoint not reached, force ConstC down by 15%
+      per cycle to recover from diverged state without manual intervention.
+
+Changes in 0.4.15:
+    - AutoCallib: replaced simple capped average with Exponential Moving Average (EMA)
+      for faster adaptation to changes in room/heater characteristics
+    - AutoMode: replaced hard 100% boost with proportional boost ramp (less overshoot)
+    - AutoMode: added lightweight integral term (PI controller) to eliminate steady-state
+      drift below setpoint; includes anti-windup clamp
+    - getUserVar: replaced unsafe eval() with json.loads() for safe persistent variable loading;
+      legacy Python dict format recovered via ast.literal_eval with immediate re-save as JSON
+    - saveUserVar: now saves as JSON instead of Python repr string
+    - except clauses narrowed from bare except to except Exception throughout
+    - parseCSV: simplified, integers only; deltamax parsed separately as float
+    - Logging: all debug/info calls now routed through WriteLog() consistently
+    - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.12" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.16" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -31,7 +57,7 @@ Version: 0.4.14 (November 13, 2023) - see history.txt for versions history
                 <option label="always" value="Forced"/>
             </options>
         </param> 
-        <param field="Mode5" label="Calc. cycle, Min. Heating time /cycle, Pause On delay, Pause Off delay, Forced mode duration (all in minutes), Delta max (°C)" width="200px" required="true" default="30,0,2,1,60,0.2"/>
+        <param field="Mode5" label="Calc. cycle, Min. Heating time /cycle, Pause On delay, Pause Off delay, Forced mode duration (all in minutes), Delta max (°C), Valve contact sensor idx (0=disabled)" width="250px" required="true" default="30,0,2,1,60,0.2,0"/>
         <param field="Mode6" label="Logging Level" width="200px">
             <options>
                 <option label="Normal" value="Normal"  default="true"/>
@@ -81,12 +107,12 @@ class BasePlugin:
         self.Heaters = []
         self.InternalsDefaults = {
             'ConstC': float(60),  # inside heating coeff, depends on room size & power of your heater (60 by default)
-            'ConstT': float(1),  # external heating coeff,depends on the insulation relative to the outside (1 by default)
+            'ConstT': float(1),  # external heating coeff, depends on insulation relative to the outside (1 by default)
             'nbCC': 0,  # number of learnings for ConstC
             'nbCT': 0,  # number of learnings for ConstT
             'LastPwr': 0,  # % power from last calculation
             'LastInT': float(0),  # inside temperature at last calculation
-            'LastOutT': float(0),  # outside temprature at last calculation
+            'LastOutT': float(0),  # outside temperature at last calculation
             'LastSetPoint': float(20),  # setpoint at time of last calculation
             'ALStatus': 0}  # AutoLearning status (0 = uninitialized, 1 = initialized, 2 = disabled)
         self.Internals = self.InternalsDefaults.copy()
@@ -95,8 +121,9 @@ class BasePlugin:
         self.pauserequested = False
         self.pauserequestchangedtime = datetime.now()
         self.forced = False
-        self.boost = True  # boost heating when boostgap is reached
-        self.boostgap = 0.5  # gap in °C between inside temp and setpoint above which turbo mode is active
+        self.boost = True        # boost heating when boostgap is reached
+        self.boostgap = 0.5      # gap in °C between inside temp and setpoint above which boost mode activates
+        self.boostmaxpower = 85  # [IMPROVED] max boost power (was hardcoded 100%). Leaves headroom to avoid overshoot.
         self.intemp = 20.0
         self.outtemp = 20.0
         self.setpoint = 20.0
@@ -109,6 +136,25 @@ class BasePlugin:
         self.loglevel = None
         self.intemperror = False
         self.versionsupported = False
+
+        # [NEW] Integral term state for PI controller.
+        # Accumulates setpoint error over cycles to correct steady-state drift below setpoint.
+        # Ki is intentionally small and conservative to nudge gently without instability.
+        # integral_error is clamped (anti-windup) to avoid excessive accumulation during long cold spells.
+        self.integral_error = 0.0
+        self.Ki = 0.1           # integral gain
+        self.integral_max = 20  # anti-windup clamp: integral contribution never exceeds ±20% power
+
+        # [NEW] Valve contact sensor support (7th value in Mode5)
+        # If configured, the heat timer starts only after the valve contact goes On (valve open).
+        # valveidx = 0 means disabled (default behaviour).
+        # valveopen = True means the valve contact has confirmed open since last heat command.
+        # valveWaitStart = time when we started waiting for the valve to open.
+        self.valveidx = 0
+        self.valveopen = False
+        self.valveWaitStart = None
+        self.heatduration_pending = 0  # heat duration (minutes) waiting for valve to open
+
         return
 
 
@@ -164,7 +210,7 @@ class BasePlugin:
             devicecreated.append(deviceparam(4, 0, "20"))  # default is 20 degrees
         if 5 not in Devices:
             Domoticz.Device(Name="Setpoint Economy", Unit=5, Type=242, Subtype=1, Used=1).Create()
-            devicecreated.append(deviceparam(5 ,0, "20"))  # default is 20 degrees
+            devicecreated.append(deviceparam(5, 0, "20"))  # default is 20 degrees
         if 6 not in Devices:
             Domoticz.Device(Name="Thermostat temp", Unit=6, TypeName="Temperature").Create()
             devicecreated.append(deviceparam(6, 0, "20"))  # default is 20 degrees
@@ -180,14 +226,15 @@ class BasePlugin:
         self.WriteLog("Outside Temperature sensors = {}".format(self.OutTempSensors), "Verbose")
         self.Heaters = parseCSV(Parameters["Mode3"])
         self.WriteLog("Heaters = {}".format(self.Heaters), "Verbose")
-        
+
         # build dict of status of all temp sensors to be used when handling timeouts
         for sensor in itertools.chain(self.InTempSensors, self.OutTempSensors):
             self.ActiveSensors[sensor] = True
 
         # splits additional parameters
+        # [IMPROVED] parseCSV now returns only integers; deltamax parsed separately as float
         params = parseCSV(Parameters["Mode5"])
-        if len(params) == 5 or len(params) == 6:
+        if len(params) >= 5:
             self.calculate_period = CheckParam("Calculation Period", params[0], 30)
             if self.calculate_period < 5:
                 Domoticz.Error("Invalid calculation period parameter. Using minimum of 5 minutes !")
@@ -202,19 +249,37 @@ class BasePlugin:
             if self.forcedduration < 15:
                 Domoticz.Error("Invalid forced mode duration parameter. Using minimum of 15 minutes !")
                 self.forcedduration = 15
-            if len(params) > 5:
-                self.deltamax = CheckParam("Delta max", params[5], 0.2)
+            # deltamax is always the 6th field and is a float - parse it directly from raw string
+            rawparams = Parameters["Mode5"].split(",")
+            if len(rawparams) > 5:
+                try:
+                    self.deltamax = float(rawparams[5])
+                except ValueError:
+                    Domoticz.Error("Delta max has invalid value, using default of 0.2")
+                    self.deltamax = 0.2
             else:
                 Domoticz.Error("Delta max missing in parameters. Add the field in the plugin configuration (default value=0.2)")
+            # read optional valve contact sensor idx (7th value in Mode5)
+            if len(rawparams) > 6:
+                try:
+                    self.valveidx = int(rawparams[6])
+                except ValueError:
+                    self.valveidx = 0
+            else:
+                self.valveidx = 0
+            if self.valveidx > 0:
+                self.WriteLog("Valve contact sensor idx = {}".format(self.valveidx), "Verbose")
+            else:
+                self.WriteLog("Valve contact sensor: disabled", "Verbose")
         else:
             Domoticz.Error("Error reading Mode5 parameters")
 
         # loads persistent variables from dedicated user variable
         # note: to reset the thermostat to default values (i.e. ignore all past learning),
-        # just delete the relevant "<plugin name>-InternalVariables" user variable Domoticz GUI and restart plugin
+        # just delete the relevant "<plugin name>-InternalVariables" user variable in Domoticz GUI and restart plugin
         self.getUserVar()
 
-        # if mode = off then make sure actual heating is off just in case if was manually set to on
+        # if mode = off then make sure actual heating is off just in case it was manually set to on
         if Devices[1].sValue == "0":
             self.switchHeat(False)
 
@@ -226,7 +291,8 @@ class BasePlugin:
 
     def onCommand(self, Unit, Command, Level, Color):
 
-        Domoticz.Debug("onCommand called for Unit {}: Command '{}', Level: {}".format(Unit, Command, Level))
+        self.WriteLog("onCommand called for Unit {}: Command '{}', Level: {}".format(Unit, Command, Level), "Verbose")
+
         # if host domoticz version is not OK than do nothing
         if not self.versionsupported:
             return
@@ -246,9 +312,21 @@ class BasePlugin:
 
         Devices[Unit].Update(nValue=nvalue, sValue=svalue)
 
-        if Unit in (1, 2, 4, 5): # force recalculation if control or mode or a setpoint changed
+        if Unit in (1, 2, 4, 5):  # force recalculation if control or mode or a setpoint changed
             self.nextcalc = datetime.now()
             self.learn = False
+            # [IMPROVED] reset integral error on setpoint/mode change to avoid windup from previous state
+            self.integral_error = 0.0
+            # [FIX] update LastSetPoint immediately so AutoCallib uses the correct reference
+            # on the very next cycle, without waiting for AutoMode() to save it
+            if Unit in (4, 5):
+                if Devices[2].sValue == "10":
+                    self.Internals['LastSetPoint'] = float(Devices[4].sValue)
+                else:
+                    self.Internals['LastSetPoint'] = float(Devices[5].sValue)
+                self.WriteLog("LastSetPoint updated immediately to {}".format(
+                    self.Internals['LastSetPoint']), "Verbose")
+                self.saveUserVar()
             self.onHeartbeat()
 
 
@@ -261,7 +339,7 @@ class BasePlugin:
         now = datetime.now()
 
         # fool proof checking.... based on users feedback
-        if not all(device in Devices for device in (1,2,3,4,5,6)):
+        if not all(device in Devices for device in (1, 2, 3, 4, 5, 6)):
             Domoticz.Error("one or more devices required by the plugin is/are missing, please check domoticz device creation settings and restart !")
             return
 
@@ -269,7 +347,7 @@ class BasePlugin:
             if self.forced or self.heat:  # thermostat setting was just changed so we kill the heating
                 self.forced = False
                 self.endheat = now
-                Domoticz.Debug("Switching heat Off !")
+                self.WriteLog("Switching heat Off !", "Verbose")
                 self.switchHeat(False)
 
         elif Devices[1].sValue == "20":  # Thermostat is in forced mode
@@ -277,13 +355,13 @@ class BasePlugin:
                 if self.endheat <= now:
                     self.forced = False
                     self.endheat = now
-                    Domoticz.Debug("Forced mode Off !")
+                    self.WriteLog("Forced mode Off !", "Verbose")
                     Devices[1].Update(nValue=1, sValue="10")  # set thermostat to normal mode
                     self.switchHeat(False)
             else:
                 self.forced = True
                 self.endheat = now + timedelta(minutes=self.forcedduration)
-                Domoticz.Debug("Forced mode On !")
+                self.WriteLog("Forced mode On !", "Verbose")
                 self.switchHeat(True)
 
         else:  # Thermostat is in mode auto
@@ -291,16 +369,19 @@ class BasePlugin:
             if self.forced:  # thermostat setting was just changed from "forced" so we kill the forced mode
                 self.forced = False
                 self.endheat = now
-                self.nextcalc = now   # this will force a recalculation on next heartbeat
-                Domoticz.Debug("Forced mode Off !")
+                self.nextcalc = now  # this will force a recalculation on next heartbeat
+                self.WriteLog("Forced mode Off !", "Verbose")
                 self.switchHeat(False)
 
             elif (self.endheat <= now or self.pause) and self.heat:  # heat cycle is over
                 self.endheat = now
                 self.heat = False
+                self.valveopen = False
+                self.heatduration_pending = 0
+                self.valveWaitStart = None
                 if self.Internals['LastPwr'] < 100:
                     self.switchHeat(False)
-                # if power was 100(i.e. a full cycle), then we let the next calculation (at next heartbeat) decide
+                # if power was 100 (i.e. a full cycle), then we let the next calculation (at next heartbeat) decide
                 # to switch off in order to avoid potentially damaging quick off/on cycles to the heater(s)
 
             elif self.pause and not self.pauserequested:  # we are in pause and the pause switch is now off
@@ -315,17 +396,29 @@ class BasePlugin:
                     self.pause = True
                     self.switchHeat(False)
 
+            elif self.valveidx > 0 and self.heatduration_pending > 0 and not self.valveopen:
+                # [NEW] valve sensor configured: we commanded heating but are waiting for valve to open
+                if self.isValveOpen():
+                    self.valveopen = True
+                    self.endheat = now + timedelta(minutes=self.heatduration_pending)
+                    self.heatduration_pending = 0
+                    self.WriteLog("Valve is now open - heat timer started, end heat = {}".format(
+                        self.endheat), "Status")
+                else:
+                    waited = round((now - self.valveWaitStart).total_seconds() / 60, 1) if self.valveWaitStart else 0
+                    self.WriteLog("Waiting for valve to open... ({} min elapsed)".format(waited), "Verbose")
+
             elif (self.nextcalc <= now) and not self.pause:  # we start a new calculation
                 self.nextcalc = now + timedelta(minutes=self.calculate_period)
                 self.WriteLog("Next calculation time will be : " + str(self.nextcalc), "Verbose")
 
-                # make current setpoint used in calculation reflect the select mode (10= normal, 20 = economy)
+                # make current setpoint used in calculation reflect the selected mode (10=normal, 20=economy)
                 if Devices[2].sValue == "10":
                     self.setpoint = float(Devices[4].sValue)
                 else:
                     self.setpoint = float(Devices[5].sValue)
 
-                # call the Domoticz json API for a temperature devices update, to get the lastest temps...
+                # call the Domoticz json API for a temperature devices update, to get the latest temps...
                 if self.readTemps():
                     # do the thermostat work
                     self.AutoMode()
@@ -334,8 +427,8 @@ class BasePlugin:
                     self.switchHeat(False)
 
         if self.nexttemps <= now:
-            # call the Domoticz json API for a temperature devices update, to get the lastest temps (and avoid the
-            # connection time out time after 10mins that floods domoticz logs in versions of domoticz since spring 2018)
+            # call the Domoticz json API for a temperature devices update, to get the latest temps (and avoid the
+            # connection time out after 10 mins that floods domoticz logs in versions of domoticz since spring 2018)
             self.readTemps()
 
         # check if need to refresh setpoints so that they do not turn red in GUI
@@ -353,6 +446,8 @@ class BasePlugin:
             self.WriteLog("Temperature exceeds setpoint", "Verbose")
             overshoot = True
             power = 0
+            # [IMPROVED] reset integral on overshoot to avoid windup fighting against natural cooldown
+            self.integral_error = 0.0
         else:
             overshoot = False
             if self.learn:
@@ -365,6 +460,18 @@ class BasePlugin:
                 power = round((self.setpoint - self.intemp) * self.Internals["ConstC"] +
                               (self.setpoint - self.outtemp) * self.Internals["ConstT"], 1)
 
+            # [NEW] PI controller: add integral term to correct steady-state drift below setpoint.
+            # The integral accumulates the temperature error each cycle and contributes a gentle
+            # correction to power. Anti-windup clamp prevents unbounded accumulation.
+            current_error = self.setpoint - self.intemp
+            self.integral_error = max(-self.integral_max / self.Ki,
+                                      min(self.integral_max / self.Ki,
+                                          self.integral_error + current_error))
+            integral_contribution = round(self.Ki * self.integral_error, 1)
+            self.WriteLog("PI: error={}, integral={}, contribution={}".format(
+                round(current_error, 2), round(self.integral_error, 2), integral_contribution), "Verbose")
+            power = round(power + integral_contribution, 1)
+
         if power < 0:
             power = 0  # lower limit
         elif power > 100:
@@ -376,23 +483,56 @@ class BasePlugin:
                 "Calculated power is {}, applying minimum power of {}".format(power, self.minheatpower), "Verbose")
             power = self.minheatpower
 
-        # apply full power if boostt mode and intemp is more than 1°C below setpoint
-        if self.boost and (self.setpoint - self.intemp) > self.boostgap:
-            self.WriteLog(
-                "Applying boost mode since current temperature is more than {}°C lower than setpoint".format(self.boostgap), "Verbose")
-            power = 100
+        # [IMPROVED] Boost mode: instead of jumping straight to 100%, apply a proportional ramp
+        # between boostgap and 2*boostgap, capped at boostmaxpower (85% by default).
+        # This avoids hard overshoot while still reacting quickly when far below setpoint.
+        if self.boost:
+            gap = self.setpoint - self.intemp
+            if gap > self.boostgap:
+                ramp_factor = min(1.0, (gap - self.boostgap) / self.boostgap)
+                boost_power = round(power + ramp_factor * (self.boostmaxpower - power), 1)
+                if boost_power > power:
+                    self.WriteLog(
+                        "Boost mode: gap={}°C, ramp={:.0f}%, power {} -> {}".format(
+                            round(gap, 2), ramp_factor * 100, power, boost_power), "Verbose")
+                    power = boost_power
+
+        if power > 100:
+            power = 100  # final upper limit after boost
 
         heatduration = round(power * self.calculate_period / 100)
         self.WriteLog("Calculation: Power = {} -> heat duration = {} minutes".format(power, heatduration), "Verbose")
 
         if power == 0:
             self.switchHeat(False)
-            Domoticz.Debug("No heating requested !")
+            self.heatduration_pending = 0
+            self.valveopen = False
+            self.valveWaitStart = None
+            self.WriteLog("No heating requested !", "Verbose")
         else:
-            self.endheat = datetime.now() + timedelta(minutes=heatduration)
-            Domoticz.Debug("End Heat time = " + str(self.endheat))
+            if self.valveidx > 0:
+                # valve sensor configured: command the heater switch (opens valve),
+                # but store heat duration as pending - timer starts only when valve contact confirms open
+                if self.isValveOpen():
+                    # valve already open (e.g. other zone already opened it)
+                    self.valveopen = True
+                    self.heatduration_pending = 0
+                    self.endheat = datetime.now() + timedelta(minutes=heatduration)
+                    self.WriteLog("Valve already open - heat timer started immediately, end heat = {}".format(
+                        self.endheat), "Status")
+                else:
+                    self.valveopen = False
+                    self.heatduration_pending = heatduration
+                    self.valveWaitStart = datetime.now()
+                    # set endheat far in the future so the cycle does not expire while waiting
+                    self.endheat = datetime.now() + timedelta(minutes=self.calculate_period + 20)
+                    self.WriteLog("Valve not yet open - waiting for contact before starting heat timer ({} min pending)".format(
+                        heatduration), "Status")
+            else:
+                # no valve sensor: original behaviour
+                self.endheat = datetime.now() + timedelta(minutes=heatduration)
+            self.WriteLog("End Heat time = " + str(self.endheat), "Verbose")
             self.switchHeat(True)
-            #if self.Internals["ALStatus"] < 2:
             self.Internals['LastPwr'] = power
             self.Internals['LastInT'] = self.intemp
             self.Internals['LastOutT'] = self.outtemp
@@ -407,40 +547,76 @@ class BasePlugin:
     def AutoCallib(self):
 
         now = datetime.now()
-        if self.Internals['ALStatus'] != 1:  # not initalized... do nothing
-            Domoticz.Debug("Fist pass at AutoCallib... no callibration")
+        if self.Internals['ALStatus'] != 1:  # not initialized... do nothing
+            self.WriteLog("First pass at AutoCallib... no calibration", "Verbose")
             pass
         elif self.Internals['LastPwr'] == 0:  # heater was off last time, do nothing
-            Domoticz.Debug("Last power was zero... no callibration")
+            self.WriteLog("Last power was zero... no calibration", "Verbose")
             pass
         elif self.Internals['LastPwr'] == 100 and self.intemp < self.Internals['LastSetPoint']:
-            # heater was on max but setpoint was not reached... no learning
-            Domoticz.Debug("Last power was 100% but setpoint not reached... no callibration")
-            pass
-        elif self.intemp > self.Internals['LastInT'] and self.Internals['LastSetPoint'] > self.Internals['LastInT']:
-            # learning ConstC
-            ConstC = (self.Internals['ConstC'] * ((self.Internals['LastSetPoint'] - self.Internals['LastInT']) /
-                                                  (self.intemp - self.Internals['LastInT']) *
-                                                  (timedelta.total_seconds(now - self.lastcalc) /
-                                                   (self.calculate_period * 60))))
-            self.WriteLog("New calc for ConstC = {}".format(ConstC), "Verbose")
-            self.Internals['ConstC'] = round((self.Internals['ConstC'] * self.Internals['nbCC'] + ConstC) /
-                                             (self.Internals['nbCC'] + 1), 1)
+            # heater was on max and setpoint was NOT reached: no learning, but
+            # [FIX] if ConstC is already very high, it means it is diverging - force it down gradually
+            if self.Internals['ConstC'] > 150:
+                self.Internals['ConstC'] = round(self.Internals['ConstC'] * 0.85, 1)
+                self.WriteLog("ConstC too high and power was 100% but setpoint not reached - forcing down to {}".format(
+                    self.Internals['ConstC']), "Status")
+            else:
+                self.WriteLog("Last power was 100% but setpoint not reached... no calibration", "Verbose")
+        elif self.Internals['LastPwr'] == 100 and self.intemp >= self.Internals['LastSetPoint']:
+            # [FIX] heater was on max AND setpoint was reached/exceeded: ConstC is too high, learn downward
+            alpha_C = max(1.0 / (self.Internals['nbCC'] + 1), 0.02)
+            ConstC_new = (self.Internals['ConstC'] * ((self.Internals['LastSetPoint'] - self.Internals['LastInT']) /
+                                                       max(self.intemp - self.Internals['LastInT'], 0.1) *
+                                                       (timedelta.total_seconds(now - self.lastcalc) /
+                                                        (self.calculate_period * 60))))
+            self.WriteLog("LastPwr was 100% but setpoint reached - learning ConstC down: new calc = {}".format(
+                ConstC_new), "Verbose")
+            self.Internals['ConstC'] = round(
+                (1 - alpha_C) * self.Internals['ConstC'] + alpha_C * ConstC_new, 1)
             self.Internals['nbCC'] = min(self.Internals['nbCC'] + 1, 50)
-            self.WriteLog("ConstC updated to {}".format(self.Internals['ConstC']), "Verbose")
+            self.WriteLog("ConstC updated to {} (alpha={})".format(
+                self.Internals['ConstC'], round(alpha_C, 3)), "Verbose")
+        elif self.intemp > self.Internals['LastInT'] and self.Internals['LastSetPoint'] > self.Internals['LastInT']:
+            # [IMPROVED] learning ConstC via Exponential Moving Average (EMA) instead of simple capped average.
+            # EMA reacts faster to physical changes (new heater, renovations, etc.)
+            # alpha converges from 1.0 (first sample) down to 0.02 (minimum, keeps adapting gently forever)
+            alpha_C = max(1.0 / (self.Internals['nbCC'] + 1), 0.02)
+            ConstC_new = (self.Internals['ConstC'] * ((self.Internals['LastSetPoint'] - self.Internals['LastInT']) /
+                                                       (self.intemp - self.Internals['LastInT']) *
+                                                       (timedelta.total_seconds(now - self.lastcalc) /
+                                                        (self.calculate_period * 60))))
+            self.WriteLog("New calc for ConstC = {}".format(ConstC_new), "Verbose")
+            self.Internals['ConstC'] = round(
+                (1 - alpha_C) * self.Internals['ConstC'] + alpha_C * ConstC_new, 1)
+            self.Internals['nbCC'] = min(self.Internals['nbCC'] + 1, 50)
+            self.WriteLog("ConstC updated to {} (alpha={})".format(
+                self.Internals['ConstC'], round(alpha_C, 3)), "Verbose")
+
         elif (self.outtemp is not None and self.Internals['LastOutT'] is not None) and \
-                 self.Internals['LastSetPoint'] > self.Internals['LastOutT']:
-            # learning ConstT
-            ConstT = (self.Internals['ConstT'] + ((self.Internals['LastSetPoint'] - self.intemp) /
-                                                  (self.Internals['LastSetPoint'] - self.Internals['LastOutT']) *
-                                                  self.Internals['ConstC'] *
-                                                  (timedelta.total_seconds(now - self.lastcalc) /
-                                                   (self.calculate_period * 60))))
-            self.WriteLog("New calc for ConstT = {}".format(ConstT), "Verbose")
-            self.Internals['ConstT'] = round((self.Internals['ConstT'] * self.Internals['nbCT'] + ConstT) /
-                                             (self.Internals['nbCT'] + 1), 1)
+                self.Internals['LastSetPoint'] > self.Internals['LastOutT']:
+            # [IMPROVED] learning ConstT via EMA as above
+            alpha_T = max(1.0 / (self.Internals['nbCT'] + 1), 0.02)
+            ConstT_new = (self.Internals['ConstT'] + ((self.Internals['LastSetPoint'] - self.intemp) /
+                                                       (self.Internals['LastSetPoint'] - self.Internals['LastOutT']) *
+                                                       self.Internals['ConstC'] *
+                                                       (timedelta.total_seconds(now - self.lastcalc) /
+                                                        (self.calculate_period * 60))))
+            self.WriteLog("New calc for ConstT = {}".format(ConstT_new), "Verbose")
+            self.Internals['ConstT'] = round(
+                (1 - alpha_T) * self.Internals['ConstT'] + alpha_T * ConstT_new, 1)
             self.Internals['nbCT'] = min(self.Internals['nbCT'] + 1, 50)
-            self.WriteLog("ConstT updated to {}".format(self.Internals['ConstT']), "Verbose")
+            self.WriteLog("ConstT updated to {} (alpha={})".format(
+                self.Internals['ConstT'], round(alpha_T, 3)), "Verbose")
+
+        # [NEW] Safety clamp: ConstC and ConstT should never exceed reasonable bounds.
+        # ConstC > 150 means even 0.5°C error gives 75% power - clearly wrong for most setups.
+        # ConstT > 10 is also unrealistic.
+        if self.Internals['ConstC'] > 150:
+            self.Internals['ConstC'] = 150.0
+            self.WriteLog("ConstC clamped to maximum of 150", "Status")
+        if self.Internals['ConstT'] > 10:
+            self.Internals['ConstT'] = 10.0
+            self.WriteLog("ConstT clamped to maximum of 10", "Status")
 
 
     def switchHeat(self, switch):
@@ -455,7 +631,7 @@ class BasePlugin:
                 if idx in self.Heaters:  # this switch is one of our heaters
                     if "Status" in device:
                         switches[idx] = True if device["Status"] == "On" else False
-                        Domoticz.Debug("Heater switch {} currently is '{}'".format(idx, device["Status"]))
+                        self.WriteLog("Heater switch {} currently is '{}'".format(idx, device["Status"]), "Verbose")
                     else:
                         Domoticz.Error("Device with idx={} does not seem to be a switch !".format(idx))
 
@@ -467,12 +643,25 @@ class BasePlugin:
         # flip on / off as needed
         self.heat = switch
         command = "On" if switch else "Off"
-        Domoticz.Debug("Heating '{}'".format(command))
+        self.WriteLog("Heating '{}'".format(command), "Verbose")
         for idx in self.Heaters:
             if switches[idx] != switch:  # check if action needed
                 DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd={}".format(idx, command))
         if switch:
-            Domoticz.Debug("End Heat time = " + str(self.endheat))
+            self.WriteLog("End Heat time = " + str(self.endheat), "Verbose")
+
+
+    def isValveOpen(self):
+        """Read the valve contact sensor status via Domoticz API. Returns True if On (valve open)."""
+        devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=light&used=true&order=Name")
+        if devicesAPI:
+            for device in devicesAPI["result"]:
+                if int(device["idx"]) == self.valveidx:
+                    status = device.get("Status", "Off")
+                    self.WriteLog("Valve contact sensor idx={} status={}".format(self.valveidx, status), "Verbose")
+                    return status == "On"
+        Domoticz.Error("Valve contact sensor idx={} not found !".format(self.valveidx))
+        return False
 
 
     def readTemps(self):
@@ -490,7 +679,7 @@ class BasePlugin:
                 idx = int(device["idx"])
                 if idx in self.InTempSensors:
                     if "Temp" in device:
-                        Domoticz.Debug("device: {}-{} = {}".format(device["idx"], device["Name"], device["Temp"]))
+                        self.WriteLog("device: {}-{} = {}".format(device["idx"], device["Name"], device["Temp"]), "Verbose")
                         # check temp sensor is not timed out
                         if not self.SensorTimedOut(idx, device["Name"], device["LastUpdate"]):
                             listintemps.append(device["Temp"])
@@ -498,7 +687,7 @@ class BasePlugin:
                         Domoticz.Error("device: {}-{} is not a Temperature sensor".format(device["idx"], device["Name"]))
                 elif idx in self.OutTempSensors:
                     if "Temp" in device:
-                        Domoticz.Debug("device: {}-{} = {}".format(device["idx"], device["Name"], device["Temp"]))
+                        self.WriteLog("device: {}-{} = {}".format(device["idx"], device["Name"], device["Temp"]), "Verbose")
                         # check temp sensor is not timed out
                         if not self.SensorTimedOut(idx, device["Name"], device["LastUpdate"]):
                             listouttemps.append(device["Temp"])
@@ -532,11 +721,11 @@ class BasePlugin:
         if nbtemps > 0:
             self.outtemp = round(sum(listouttemps) / nbtemps, 1)
         else:
-            Domoticz.Debug("No Outside Temperature found...")
+            self.WriteLog("No Outside Temperature found...", "Verbose")
             self.outtemp = None
 
-        Domoticz.Debug("Inside Temperature = {}".format(self.intemp))
-        Domoticz.Debug("Outside Temperature = {}".format(self.outtemp))
+        self.WriteLog("Inside Temperature = {}".format(self.intemp), "Verbose")
+        self.WriteLog("Outside Temperature = {}".format(self.outtemp), "Verbose")
         return noerror
 
 
@@ -557,15 +746,24 @@ class BasePlugin:
             if novar:
                 # create user variable since it does not exist
                 self.WriteLog("User Variable {} does not exist. Creating it.".format(varname), "Verbose")
-                # actually calling Domoticz API
                 DomoticzAPI("type=command&param=adduservariable&vname={}&vtype=2&vvalue={}".format(
-                    varname, str(self.InternalsDefaults)))
-                self.Internals = self.InternalsDefaults.copy()  # we re-initialize the internal variables
+                    varname, parse.quote(json.dumps(self.InternalsDefaults))))
+                self.Internals = self.InternalsDefaults.copy()
             else:
+                # [IMPROVED] use json.loads() instead of eval() for safe deserialization.
+                # On first run after upgrade from older version, the variable is in Python dict format:
+                # recover it via ast.literal_eval (safe subset of eval) and immediately re-save as JSON.
                 try:
-                    self.Internals.update(eval(valuestring))
-                except:
-                    self.Internals = self.InternalsDefaults.copy()
+                    self.Internals.update(json.loads(valuestring))
+                except Exception:
+                    try:
+                        import ast
+                        self.Internals.update(ast.literal_eval(valuestring))
+                        self.WriteLog("Internal variables loaded via legacy format. Re-saving as JSON.", "Status")
+                        self.saveUserVar()  # immediately convert to JSON format
+                    except Exception:
+                        Domoticz.Error("Cannot parse internal variables, resetting to defaults")
+                        self.Internals = self.InternalsDefaults.copy()
                 return
         else:
             Domoticz.Error("Cannot read the uservariable holding the persistent variables")
@@ -574,9 +772,10 @@ class BasePlugin:
 
     def saveUserVar(self):
 
+        # [IMPROVED] save as JSON string instead of Python repr string (safer, standard)
         varname = Parameters["Name"] + "-InternalVariables"
         DomoticzAPI("type=command&param=updateuservariable&vname={}&vtype=2&vvalue={}".format(
-            varname, str(self.Internals)))
+            varname, parse.quote(json.dumps(self.Internals))))
 
 
     def WriteLog(self, message, level="Normal"):
@@ -640,20 +839,13 @@ def onHeartbeat():
 # Plugin utility functions ---------------------------------------------------
 
 def parseCSV(strCSV):
-
+    """Parse a comma-separated string of integers. Non-integer values are silently skipped."""
     listvals = []
-    i=0
     for value in strCSV.split(","):
         try:
-            if i == 5:
-                val = float(value)
-            else:
-                val = int(value)
-        except:
+            listvals.append(int(value))
+        except ValueError:
             pass
-        else:
-            listvals.append(val)
-        i+=1
     return listvals
 
 
@@ -678,8 +870,8 @@ def DomoticzAPI(APICall):
                 resultJson = None
         else:
             Domoticz.Error("Domoticz API: http error = {}".format(response.status))
-    except:
-        Domoticz.Error("Error calling '{}'".format(url))
+    except Exception as e:
+        Domoticz.Error("Error calling '{}': {}".format(url, str(e)))
     return resultJson
 
 
@@ -690,7 +882,7 @@ def CheckParam(name, value, default):
         param = value
     else:
         param = default
-        Domoticz.Error("Parameter '{}' has an invalid value of '{}' ! defaut of '{}' is instead used.".format(name, value, default))
+        Domoticz.Error("Parameter '{}' has an invalid value of '{}' ! default of '{}' is instead used.".format(name, value, default))
     return param
 
 
