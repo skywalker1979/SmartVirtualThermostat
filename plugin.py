@@ -4,7 +4,15 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.16 (March 2026) - see history.txt for versions history
+Version: 0.4.17 (March 2026) - see history.txt for versions history
+
+Changes in 0.4.17:
+    - Fix: ConstT learning now uses Exponential Moving Average (EMA) instead of additive delta.
+      Previous formula used += delta which could only grow over time and never converge downward.
+      EMA allows ConstT to decrease naturally when outside temperatures rise (e.g. spring/summer),
+      symmetrically with how ConstC is already learned.
+    - Fix: added safety clamp lower bounds: ConstC minimum 1.0, ConstT minimum 0.0.
+      Previously only upper bounds were enforced (ConstC max 150, ConstT max 10).
 
 Changes in 0.4.16:
     - Added optional valve contact sensor support (7th value in Mode5): when configured, the heat
@@ -33,7 +41,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.16" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.17" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -594,13 +602,15 @@ class BasePlugin:
 
         elif (self.outtemp is not None and self.Internals['LastOutT'] is not None) and \
                 self.Internals['LastSetPoint'] > self.Internals['LastOutT']:
-            # [IMPROVED] learning ConstT via EMA as above
+            # [FIX] learning ConstT via EMA - same approach as ConstC.
+            # Previous formula used += delta which could only grow over time and never converge downward.
+            # EMA allows ConstT to decrease naturally when outside temperatures rise (e.g. spring/summer).
             alpha_T = max(1.0 / (self.Internals['nbCT'] + 1), 0.02)
-            ConstT_new = (self.Internals['ConstT'] + ((self.Internals['LastSetPoint'] - self.intemp) /
-                                                       (self.Internals['LastSetPoint'] - self.Internals['LastOutT']) *
-                                                       self.Internals['ConstC'] *
-                                                       (timedelta.total_seconds(now - self.lastcalc) /
-                                                        (self.calculate_period * 60))))
+            ConstT_new = ((self.Internals['LastSetPoint'] - self.intemp) /
+                          max(self.Internals['LastSetPoint'] - self.Internals['LastOutT'], 0.1) *
+                          self.Internals['ConstC'] *
+                          (timedelta.total_seconds(now - self.lastcalc) /
+                           (self.calculate_period * 60)))
             self.WriteLog("New calc for ConstT = {}".format(ConstT_new), "Verbose")
             self.Internals['ConstT'] = round(
                 (1 - alpha_T) * self.Internals['ConstT'] + alpha_T * ConstT_new, 1)
@@ -608,15 +618,24 @@ class BasePlugin:
             self.WriteLog("ConstT updated to {} (alpha={})".format(
                 self.Internals['ConstT'], round(alpha_T, 3)), "Verbose")
 
-        # [NEW] Safety clamp: ConstC and ConstT should never exceed reasonable bounds.
-        # ConstC > 150 means even 0.5°C error gives 75% power - clearly wrong for most setups.
-        # ConstT > 10 is also unrealistic.
+        # [NEW] Safety clamp: ConstC and ConstT must stay within reasonable bounds in both directions.
+        # Upper bounds: ConstC > 150 means even 0.5°C error gives 75% power - clearly wrong.
+        #               ConstT > 10 is unrealistic for any normal installation.
+        # Lower bounds: ConstC < 1.0 means even 10°C error gives less than 1% power - also wrong.
+        #               ConstT < 0.0 is physically meaningless (negative external contribution).
         if self.Internals['ConstC'] > 150:
             self.Internals['ConstC'] = 150.0
             self.WriteLog("ConstC clamped to maximum of 150", "Status")
+        elif self.Internals['ConstC'] < 1.0:
+            self.Internals['ConstC'] = 1.0
+            self.WriteLog("ConstC clamped to minimum of 1.0", "Status")
+
         if self.Internals['ConstT'] > 10:
             self.Internals['ConstT'] = 10.0
             self.WriteLog("ConstT clamped to maximum of 10", "Status")
+        elif self.Internals['ConstT'] < 0.0:
+            self.Internals['ConstT'] = 0.0
+            self.WriteLog("ConstT clamped to minimum of 0.0", "Status")
 
 
     def switchHeat(self, switch):
