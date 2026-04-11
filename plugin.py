@@ -4,7 +4,16 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.17 (March 2026) - see history.txt for versions history
+Version: 0.4.18 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.18:
+    - Added dynamic beta calculation from external temperature history.
+      Every 24h, fetches the last 7 days of external temperature data from Domoticz API
+      and computes beta as the average daily temperature range (max - min).
+      Beta reduces effective_nbCT when computing alpha_T, making ConstT learning faster
+      during high thermal variability (autumn/winter swings) and slower when stable.
+      If no external sensor is configured, beta stays 0.0 (behaviour unchanged).
+      New persistent fields: 'beta' and 'LastBetaUpdate'.
 
 Changes in 0.4.17:
     - Fix: ConstT learning now uses Exponential Moving Average (EMA) instead of additive delta.
@@ -43,7 +52,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.17" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.18" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -124,7 +133,9 @@ class BasePlugin:
             'LastInT': float(0),  # inside temperature at last calculation
             'LastOutT': float(0),  # outside temperature at last calculation
             'LastSetPoint': float(20),  # setpoint at time of last calculation
-            'ALStatus': 0}  # AutoLearning status (0 = uninitialized, 1 = initialized, 2 = disabled)
+            'ALStatus': 0,  # AutoLearning status (0 = uninitialized, 1 = initialized, 2 = disabled)
+            'beta': 0.0,          # [NEW] average daily external temp range (max-min) over last 7 days
+            'LastBetaUpdate': ""}  # [NEW] date of last beta update (YYYY-MM-DD string)
         self.Internals = self.InternalsDefaults.copy()
         self.heat = False
         self.pause = False
@@ -428,6 +439,9 @@ class BasePlugin:
                 else:
                     self.setpoint = float(Devices[5].sValue)
 
+                # [NEW] update beta from external temperature history every 24h
+                self.updateBeta()
+
                 # call the Domoticz json API for a temperature devices update, to get the latest temps...
                 if self.readTemps():
                     # do the thermostat work
@@ -607,13 +621,18 @@ class BasePlugin:
             # [FIX] learning ConstT via EMA - same approach as ConstC.
             # Previous formula used += delta which could only grow over time and never converge downward.
             # EMA allows ConstT to decrease naturally when outside temperatures rise (e.g. spring/summer).
-            alpha_T = max(1.0 / (self.Internals['nbCT'] + 1), 0.02)
+            # [NEW] beta reduces effective_nbCT proportionally to recent external temperature variability:
+            # higher beta (large daily ranges) -> lower effective_nbCT -> higher alpha_T -> faster adaptation.
+            beta = self.Internals.get('beta', 0.0)
+            effective_nbCT = max(0, self.Internals['nbCT'] - int(beta))
+            alpha_T = max(1.0 / (effective_nbCT + 1), 0.02)
             ConstT_new = ((self.Internals['LastSetPoint'] - self.intemp) /
                           max(self.Internals['LastSetPoint'] - self.Internals['LastOutT'], 0.1) *
                           self.Internals['ConstC'] *
                           (timedelta.total_seconds(now - self.lastcalc) /
                            (self.calculate_period * 60)))
-            self.WriteLog("New calc for ConstT = {}".format(ConstT_new), "Verbose")
+            self.WriteLog("New calc for ConstT = {} (beta={}, effective_nbCT={}, alpha={})".format(
+                round(ConstT_new, 3), beta, effective_nbCT, round(alpha_T, 3)), "Verbose")
             self.Internals['ConstT'] = round(
                 (1 - alpha_T) * self.Internals['ConstT'] + alpha_T * ConstT_new, 1)
             self.Internals['nbCT'] = min(self.Internals['nbCT'] + 1, 50)
@@ -646,6 +665,47 @@ class BasePlugin:
             self.Internals['ConstT'] = 0.0
             self.WriteLog("ConstT clamped to minimum of 0.0", "Status")
 
+
+
+    def updateBeta(self):
+        """Fetch last 7 days of external temperature history and compute beta
+        as the average daily range (max - min). Called every 24h.
+        If no external sensor is configured, beta remains 0.0 (no effect on learning).
+        """
+        if not self.OutTempSensors:
+            return  # no external sensor configured, nothing to do
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.Internals.get('LastBetaUpdate', '') == today:
+            return  # already updated today
+
+        idx = self.OutTempSensors[0]  # use first external sensor
+        apiresult = DomoticzAPI("type=command&param=graph&sensor=temp&idx={}&range=month".format(idx))
+        if not apiresult or "result" not in apiresult:
+            Domoticz.Error("updateBeta: failed to fetch temperature history for idx={}".format(idx))
+            return
+
+        # take last 7 days of data
+        data = apiresult["result"][-7:]
+        if len(data) == 0:
+            return
+
+        ranges = []
+        for day in data:
+            try:
+                te = float(day["te"])
+                tm = float(day["tm"])
+                ranges.append(te - tm)
+            except Exception:
+                pass
+
+        if ranges:
+            beta = round(sum(ranges) / len(ranges), 1)
+            self.Internals['beta'] = beta
+            self.Internals['LastBetaUpdate'] = today
+            self.saveUserVar()
+            self.WriteLog("Beta updated: avg daily range over last {} days = {}°C".format(
+                len(ranges), beta), "Status")
 
     def switchHeat(self, switch):
 
