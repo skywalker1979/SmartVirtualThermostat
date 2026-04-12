@@ -4,7 +4,12 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.18 (April 2026) - see history.txt for versions history
+Version: 0.4.19 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.19:
+    - Fix: on plugin restart, pause state is now restored from the Thermostat Pause device status.
+      Previously, restarting the plugin while pause was active would cause the heater to turn on
+      because internal pause state was always reset to False on startup.
 
 Changes in 0.4.18:
     - Added dynamic beta calculation from external temperature history.
@@ -52,7 +57,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.18" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.19" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -299,6 +304,14 @@ class BasePlugin:
         # note: to reset the thermostat to default values (i.e. ignore all past learning),
         # just delete the relevant "<plugin name>-InternalVariables" user variable in Domoticz GUI and restart plugin
         self.getUserVar()
+
+        # [FIX] restore pause state from device status in case plugin was restarted while pause was active
+        if Devices[3].nValue == 1:
+            self.pauserequested = True
+            self.pause = True
+            # set pauserequestchangedtime in the past so pause is effective immediately (no delay on restart)
+            self.pauserequestchangedtime = datetime.now() - timedelta(minutes=self.pauseondelay + 1)
+            self.WriteLog("Pause state restored from device status", "Status")
 
         # if mode = off then make sure actual heating is off just in case it was manually set to on
         if Devices[1].sValue == "0":
