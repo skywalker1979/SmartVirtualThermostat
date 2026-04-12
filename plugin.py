@@ -4,7 +4,19 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.20 (April 2026) - see history.txt for versions history
+Version: 0.4.21 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.21:
+    - Fix: lastcalc initialized to None in __init__ and checked before use in AutoCallib to avoid
+      a near-zero timedelta on the very first cycle causing anomalous ConstC/ConstT calculations.
+    - Fix: self.heat explicitly set to False in pause activation and forced mode transitions
+      to prevent it remaining True if switchHeat() returns early (no heaters found).
+    - Fix: isValveOpen() and switchHeat() now use getdevices&rid=<idx> for single-device queries
+      instead of downloading the full device list, reducing API call overhead.
+    - Fix: updateBeta() skips the current (incomplete) day and uses the last 7 complete days
+      to avoid using partial daily data that would skew the beta calculation.
+    - Fix: AutoCallib guards against lastcalc==now (zero timedelta) to prevent ConstC/ConstT
+      being driven toward zero by a division producing 0.
 
 Changes in 0.4.20:
     - Fix: valve wait state (heatduration_pending, valveopen, valveWaitStart) is now reset in all
@@ -63,7 +75,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.20" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.21" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -161,7 +173,7 @@ class BasePlugin:
         self.setpoint = 20.0
         self.endheat = datetime.now()
         self.nextcalc = self.endheat
-        self.lastcalc = self.endheat
+        self.lastcalc = None  # [FIX] None until first AutoMode() call; guards against zero timedelta in AutoCallib
         self.nextupdate = self.endheat
         self.nexttemps = self.endheat
         self.learn = True
@@ -410,6 +422,7 @@ class BasePlugin:
                 self.forced = True
                 self.endheat = now + timedelta(minutes=self.forcedduration)
                 self.WriteLog("Forced mode On !", "Verbose")
+                self.heat = True  # [FIX] explicitly set heat flag when forced mode starts
                 self.switchHeat(True)
                 # [FIX] reset valve wait state when forced mode starts
                 self.heatduration_pending = 0
@@ -450,6 +463,7 @@ class BasePlugin:
                 if self.pauserequestchangedtime + timedelta(minutes=self.pauseondelay) <= now:
                     self.WriteLog("Pause is now On", "Status")
                     self.pause = True
+                    self.heat = False  # [FIX] explicitly reset heat flag in case switchHeat() returned early
                     self.switchHeat(False)
                     # [FIX] reset valve wait state when pause is activated
                     self.heatduration_pending = 0
@@ -610,6 +624,10 @@ class BasePlugin:
     def AutoCallib(self):
 
         now = datetime.now()
+        # [FIX] skip calibration if lastcalc is None (first cycle) or zero timedelta to avoid division anomalies
+        if self.lastcalc is None or (now - self.lastcalc).total_seconds() < 1:
+            self.WriteLog("AutoCallib: skipping - lastcalc not yet set or zero timedelta", "Verbose")
+            return
         if self.Internals['ALStatus'] != 1:  # not initialized... do nothing
             self.WriteLog("First pass at AutoCallib... no calibration", "Verbose")
             pass
@@ -724,8 +742,9 @@ class BasePlugin:
             Domoticz.Error("updateBeta: failed to fetch temperature history for idx={}".format(idx))
             return
 
-        # take last 7 days of data
-        data = apiresult["result"][-7:]
+        # take last 7 complete days (skip today which may be incomplete at time of calculation)
+        complete_data = [d for d in apiresult["result"] if d["d"] != today]
+        data = complete_data[-7:]
         if len(data) == 0:
             return
 
@@ -780,13 +799,13 @@ class BasePlugin:
 
     def isValveOpen(self):
         """Read the valve contact sensor status via Domoticz API. Returns True if On (valve open)."""
-        devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=light&used=true&order=Name")
-        if devicesAPI:
-            for device in devicesAPI["result"]:
-                if int(device["idx"]) == self.valveidx:
-                    status = device.get("Status", "Off")
-                    self.WriteLog("Valve contact sensor idx={} status={}".format(self.valveidx, status), "Verbose")
-                    return status == "On"
+        # [FIX] use rid= to fetch only the specific device instead of the full list
+        devicesAPI = DomoticzAPI("type=command&param=getdevices&rid={}".format(self.valveidx))
+        if devicesAPI and "result" in devicesAPI and len(devicesAPI["result"]) > 0:
+            device = devicesAPI["result"][0]
+            status = device.get("Status", "Off")
+            self.WriteLog("Valve contact sensor idx={} status={}".format(self.valveidx, status), "Verbose")
+            return status == "On"
         Domoticz.Error("Valve contact sensor idx={} not found !".format(self.valveidx))
         return False
 
