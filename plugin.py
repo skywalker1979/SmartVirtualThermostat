@@ -4,7 +4,13 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.19 (April 2026) - see history.txt for versions history
+Version: 0.4.20 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.20:
+    - Fix: valve wait state (heatduration_pending, valveopen, valveWaitStart) is now reset in all
+      cases where heating is interrupted: thermostat Off, Pause activation, Forced mode on/off,
+      and any onCommand that forces recalculation. Previously, heatduration_pending could remain
+      nonzero (zombie state) blocking the plugin in "Waiting for valve" loop indefinitely.
 
 Changes in 0.4.19:
     - Fix: on plugin restart, pause state is now restored from the Thermostat Pause device status.
@@ -57,7 +63,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.19" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.20" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -351,6 +357,10 @@ class BasePlugin:
             self.learn = False
             # [IMPROVED] reset integral error on setpoint/mode change to avoid windup from previous state
             self.integral_error = 0.0
+            # [FIX] reset valve wait state to avoid zombie heatduration_pending blocking the next cycle
+            self.heatduration_pending = 0
+            self.valveopen = False
+            self.valveWaitStart = None
             # [FIX] update LastSetPoint immediately so AutoCallib uses the correct reference
             # on the very next cycle, without waiting for AutoMode() to save it
             if Unit in (4, 5):
@@ -383,6 +393,10 @@ class BasePlugin:
                 self.endheat = now
                 self.WriteLog("Switching heat Off !", "Verbose")
                 self.switchHeat(False)
+            # [FIX] always reset valve wait state when thermostat is off
+            self.heatduration_pending = 0
+            self.valveopen = False
+            self.valveWaitStart = None
 
         elif Devices[1].sValue == "20":  # Thermostat is in forced mode
             if self.forced:
@@ -397,6 +411,10 @@ class BasePlugin:
                 self.endheat = now + timedelta(minutes=self.forcedduration)
                 self.WriteLog("Forced mode On !", "Verbose")
                 self.switchHeat(True)
+                # [FIX] reset valve wait state when forced mode starts
+                self.heatduration_pending = 0
+                self.valveopen = False
+                self.valveWaitStart = None
 
         else:  # Thermostat is in mode auto
 
@@ -406,6 +424,10 @@ class BasePlugin:
                 self.nextcalc = now  # this will force a recalculation on next heartbeat
                 self.WriteLog("Forced mode Off !", "Verbose")
                 self.switchHeat(False)
+                # [FIX] reset valve wait state when forced mode ends
+                self.heatduration_pending = 0
+                self.valveopen = False
+                self.valveWaitStart = None
 
             elif (self.endheat <= now or self.pause) and self.heat:  # heat cycle is over
                 self.endheat = now
@@ -429,6 +451,10 @@ class BasePlugin:
                     self.WriteLog("Pause is now On", "Status")
                     self.pause = True
                     self.switchHeat(False)
+                    # [FIX] reset valve wait state when pause is activated
+                    self.heatduration_pending = 0
+                    self.valveopen = False
+                    self.valveWaitStart = None
 
             elif self.valveidx > 0 and self.heatduration_pending > 0 and not self.valveopen:
                 # [NEW] valve sensor configured: we commanded heating but are waiting for valve to open
