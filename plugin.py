@@ -4,7 +4,13 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.22 (April 2026) - see history.txt for versions history
+Version: 0.4.23 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.23:
+    - Fix: ConstC recovery now triggers when ConstC > 120 (instead of > 150) and setpoint is
+      reached or exceeded. Previously ConstC could stay in the 120-150 range indefinitely,
+      producing anomalous power calculations and spurious short heating cycles in spring/autumn
+      when less heating power is needed than in winter.
 
 Changes in 0.4.22:
     - Improved: updateBeta() now logs each day used in the calculation (date, max, min, range)
@@ -79,7 +85,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.22" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.23" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -647,6 +653,14 @@ class BasePlugin:
                     self.Internals['ConstC']), "Status")
             else:
                 self.WriteLog("Last power was 100% but setpoint not reached... no calibration", "Verbose")
+        elif self.Internals['ConstC'] > 120 and self.intemp >= self.Internals['LastSetPoint']:
+            # [FIX] ConstC is approaching maximum and setpoint was reached: ConstC is too high for current
+            # conditions (e.g. spring/autumn). Force it down gradually at 15% per cycle.
+            # This is symmetric with the ConstT recovery logic and does not prevent ConstC from rising
+            # again in winter if needed (EMA learning will raise it when setpoint is not reached).
+            self.Internals['ConstC'] = round(self.Internals['ConstC'] * 0.85, 1)
+            self.WriteLog("ConstC above 120 and setpoint reached - forcing down to {}".format(
+                self.Internals['ConstC']), "Status")
         elif self.Internals['LastPwr'] == 100 and self.intemp >= self.Internals['LastSetPoint']:
             # [FIX] heater was on max AND setpoint was reached/exceeded: ConstC is too high, learn downward
             alpha_C = max(1.0 / (self.Internals['nbCC'] + 1), 0.02)
