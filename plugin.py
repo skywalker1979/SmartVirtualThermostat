@@ -4,7 +4,11 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.21 (April 2026) - see history.txt for versions history
+Version: 0.4.22 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.22:
+    - Improved: updateBeta() now logs each day used in the calculation (date, max, min, range)
+      and the resulting average in Verbose mode, for easier diagnostics.
 
 Changes in 0.4.21:
     - Fix: lastcalc initialized to None in __init__ and checked before use in AutoCallib to avoid
@@ -75,7 +79,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.21" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.22" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -753,7 +757,10 @@ class BasePlugin:
             try:
                 te = float(day["te"])
                 tm = float(day["tm"])
-                ranges.append(te - tm)
+                day_range = round(te - tm, 1)
+                ranges.append(day_range)
+                self.WriteLog("Beta day {}: max={}, min={}, range={}°C".format(
+                    day["d"], te, tm, day_range), "Verbose")
             except Exception:
                 pass
 
