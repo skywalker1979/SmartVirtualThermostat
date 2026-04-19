@@ -4,7 +4,15 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.24 (April 2026) - see history.txt for versions history
+Version: 0.4.25 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.25:
+    - Improved overshoot detection: ConstC reduction is now proportional to the indoor/outdoor
+      temperature difference. When the gap is small (fuori quasi quanto dentro), the reduction
+      is attenuated or skipped entirely, avoiding aggressive ConstC drops caused by natural
+      heat gain (sun, external warmth) rather than excessive heating power.
+      Formula: factor = clamp((diff - 3) / 10, 0.0, 1.0); reduction = 15% * factor.
+      ConstC will not drop below a minimum of 30.0 to preserve a useful heating baseline.
 
 Changes in 0.4.24:
     - Added minimum useful heat duration parameter (8th value in Mode5, default 0 = disabled).
@@ -97,7 +105,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.24" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.25" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -685,12 +693,25 @@ class BasePlugin:
             self.WriteLog("Last power was zero... no calibration", "Verbose")
             pass
         elif self.intemp > self.Internals['LastSetPoint'] and self.Internals['LastPwr'] > 0:
-            # [FIX] overshoot detected: temperature exceeded setpoint after a heating cycle.
-            # This means ConstC calculated too much power regardless of its absolute value.
-            # Force ConstC down by 15% per cycle until overshoot stops.
-            self.Internals['ConstC'] = round(self.Internals['ConstC'] * 0.85, 1)
-            self.WriteLog("Overshoot detected (intemp={} > LastSetPoint={}) - forcing ConstC down to {}".format(
-                self.intemp, self.Internals['LastSetPoint'], self.Internals['ConstC']), "Status")
+            # [IMPROVED] overshoot detected after a heating cycle: reduce ConstC proportionally
+            # to the indoor/outdoor temperature difference. A small diff means the overshoot is
+            # likely caused by natural heat gain (sun, warm outside) rather than excessive heating.
+            # factor=0 when diff<=3°C (no reduction), factor=1 when diff>=13°C (full 15% reduction).
+            # ConstC is clamped to a minimum of 30.0 to preserve a useful heating baseline.
+            if self.outtemp is not None:
+                diff = self.intemp - self.outtemp
+            else:
+                diff = self.intemp - self.Internals['LastOutT']
+            factor = min(1.0, max(0.0, (diff - 3) / 10))
+            if factor > 0:
+                new_constC = max(30.0, round(self.Internals['ConstC'] * (1.0 - 0.15 * factor), 1))
+                self.WriteLog("Overshoot detected (intemp={} > LastSetPoint={}, diff={}°C, factor={:.2f}) - ConstC {} -> {}".format(
+                    self.intemp, self.Internals['LastSetPoint'], round(diff, 1), factor,
+                    self.Internals['ConstC'], new_constC), "Status")
+                self.Internals['ConstC'] = new_constC
+            else:
+                self.WriteLog("Overshoot detected but diff={}°C <= 3°C - natural heat gain, ConstC unchanged".format(
+                    round(diff, 1)), "Verbose")
         elif self.Internals['LastPwr'] == 100 and self.intemp < self.Internals['LastSetPoint']:
             # heater was on max and setpoint was NOT reached: no learning, but
             # [FIX] if ConstC is already very high, it means it is diverging - force it down gradually
