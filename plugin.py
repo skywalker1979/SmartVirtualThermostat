@@ -4,7 +4,20 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.25 (April 2026) - see history.txt for versions history
+Version: 0.4.26 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.26:
+    - Fix: overshoot detection now handles missing external temperature gracefully - no crash
+      when both outtemp and LastOutT are None (first cycle without external sensor).
+    - Fix: ConstC minimum clamp now consistently enforces 30.0 everywhere (was 1.0 in global
+      clamp but 30.0 in overshoot logic, causing contradiction).
+    - Fix: ConstT learning formula now uses abs() on denominator to prevent negative ConstT_new
+      when LastSetPoint < LastOutT (rare but possible in spring with low setpoint and warm sun).
+    - Fix: updateBeta() now validates data availability - warns if <7 days, skips if <3 days
+      to avoid unstable beta calculation from insufficient temperature history.
+    - Improved: valve wait logging - progressive warnings at 2, 5, 10 min and every 5 min after.
+      Relay stays open (valve keeps trying to open), heating starts only when valve contact confirms.
+      No forced timeout - valve may take longer than 5 minutes in some installations.
 
 Changes in 0.4.25:
     - Improved overshoot detection: ConstC reduction is now proportional to the indoor/outdoor
@@ -105,7 +118,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.25" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.26" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -528,7 +541,12 @@ class BasePlugin:
                         self.endheat), "Status")
                 else:
                     waited = round((now - self.valveWaitStart).total_seconds() / 60, 1) if self.valveWaitStart else 0
-                    self.WriteLog("Waiting for valve to open... ({} min elapsed)".format(waited), "Verbose")
+                    # [FIX] progressive warnings for long valve wait (relay stays open, heating waits for valve contact)
+                    # Log at 2, 5, 10 minutes and every 5 minutes after that
+                    if waited >= 2 and (waited == 2 or waited == 5 or waited == 10 or (waited > 10 and int(waited) % 5 == 0)):
+                        Domoticz.Error("Valve still not open after {} minutes - relay open, waiting for valve contact".format(int(waited)))
+                    else:
+                        self.WriteLog("Waiting for valve to open... ({} min elapsed)".format(waited), "Verbose")
 
             elif (self.nextcalc <= now) and not self.pause:  # we start a new calculation
                 self.nextcalc = now + timedelta(minutes=self.calculate_period)
@@ -700,8 +718,11 @@ class BasePlugin:
             # ConstC is clamped to a minimum of 30.0 to preserve a useful heating baseline.
             if self.outtemp is not None:
                 diff = self.intemp - self.outtemp
-            else:
+            elif self.Internals['LastOutT'] is not None:
                 diff = self.intemp - self.Internals['LastOutT']
+            else:
+                # [FIX] no external temp available: assume diff large enough to apply reduction
+                diff = 10.0
             factor = min(1.0, max(0.0, (diff - 3) / 10))
             if factor > 0:
                 new_constC = max(30.0, round(self.Internals['ConstC'] * (1.0 - 0.15 * factor), 1))
@@ -766,11 +787,12 @@ class BasePlugin:
             # EMA allows ConstT to decrease naturally when outside temperatures rise (e.g. spring/summer).
             # [NEW] beta reduces effective_nbCT proportionally to recent external temperature variability:
             # higher beta (large daily ranges) -> lower effective_nbCT -> higher alpha_T -> faster adaptation.
+            # [FIX] use abs() on denominator to prevent negative ConstT_new when LastSetPoint < LastOutT
             beta = self.Internals.get('beta', 0.0)
             effective_nbCT = max(0, self.Internals['nbCT'] - int(beta))
             alpha_T = max(1.0 / (effective_nbCT + 1), 0.02)
             ConstT_new = ((self.Internals['LastSetPoint'] - self.intemp) /
-                          max(self.Internals['LastSetPoint'] - self.Internals['LastOutT'], 0.1) *
+                          max(abs(self.Internals['LastSetPoint'] - self.Internals['LastOutT']), 0.1) *
                           self.Internals['ConstC'] *
                           (timedelta.total_seconds(now - self.lastcalc) /
                            (self.calculate_period * 60)))
@@ -792,14 +814,14 @@ class BasePlugin:
         # [NEW] Safety clamp: ConstC and ConstT must stay within reasonable bounds in both directions.
         # Upper bounds: ConstC > 150 means even 0.5°C error gives 75% power - clearly wrong.
         #               ConstT > 10 is unrealistic for any normal installation.
-        # Lower bounds: ConstC < 1.0 means even 10°C error gives less than 1% power - also wrong.
+        # Lower bounds: ConstC < 30.0 means heating power too weak for practical operation.
         #               ConstT < 0.0 is physically meaningless (negative external contribution).
         if self.Internals['ConstC'] > 150:
             self.Internals['ConstC'] = 150.0
             self.WriteLog("ConstC clamped to maximum of 150", "Status")
-        elif self.Internals['ConstC'] < 1.0:
-            self.Internals['ConstC'] = 1.0
-            self.WriteLog("ConstC clamped to minimum of 1.0", "Status")
+        elif self.Internals['ConstC'] < 30.0:
+            self.Internals['ConstC'] = 30.0
+            self.WriteLog("ConstC clamped to minimum of 30.0", "Status")
 
         if self.Internals['ConstT'] > 10:
             self.Internals['ConstT'] = 10.0
@@ -833,6 +855,14 @@ class BasePlugin:
         data = complete_data[-7:]
         if len(data) == 0:
             return
+        
+        # [FIX] warn if insufficient data for reliable beta calculation
+        if len(data) < 7:
+            self.WriteLog("updateBeta: only {} complete days available (need 7), beta may be unstable".format(
+                len(data)), "Status")
+            if len(data) < 3:
+                self.WriteLog("updateBeta: too few days ({}), skipping beta update".format(len(data)), "Status")
+                return
 
         ranges = []
         for day in data:
