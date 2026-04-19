@@ -4,7 +4,19 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.23 (April 2026) - see history.txt for versions history
+Version: 0.4.24 (April 2026) - see history.txt for versions history
+
+Changes in 0.4.24:
+    - Added minimum useful heat duration parameter (8th value in Mode5, default 0 = disabled).
+      If configured, heating cycles shorter than this value (in minutes) are skipped entirely.
+      This avoids pointless short cycles that waste valve wear without meaningful heat output.
+      Maximum allowed value is calculate_period / 2; values above are clamped with a warning.
+    - Fix: overshoot detection in AutoCallib: if intemp > LastSetPoint after a heating cycle,
+      ConstC is forced down by 15% per cycle regardless of its absolute value. Previously ConstC
+      could remain high and cause repeated overshoot indefinitely.
+    - Fix: heatduration == 0 with power > 0 no longer triggers heater switch. Previously a
+      fractional power value could produce heatduration=0 after rounding but still activate
+      the relay, causing the valve to open and close immediately with no useful heat.
 
 Changes in 0.4.23:
     - Fix: ConstC recovery now triggers when ConstC > 120 (instead of > 150) and setpoint is
@@ -85,7 +97,7 @@ Changes in 0.4.15:
     - Fix: version tag in XML header updated to match actual version
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.23" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.24" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -109,7 +121,7 @@ Changes in 0.4.15:
                 <option label="always" value="Forced"/>
             </options>
         </param> 
-        <param field="Mode5" label="Calc. cycle, Min. Heating time /cycle, Pause On delay, Pause Off delay, Forced mode duration (all in minutes), Delta max (°C), Valve contact sensor idx (0=disabled)" width="250px" required="true" default="30,0,2,1,60,0.2,0"/>
+        <param field="Mode5" label="Calc. cycle, Min. Heating time /cycle, Pause On delay, Pause Off delay, Forced mode duration (all in minutes), Delta max (°C), Valve contact sensor idx (0=disabled), Min useful heat duration in minutes (0=disabled)" width="300px" required="true" default="30,0,2,1,60,0.2,0,0"/>
         <param field="Mode6" label="Logging Level" width="200px">
             <options>
                 <option label="Normal" value="Normal"  default="true"/>
@@ -153,6 +165,7 @@ class BasePlugin:
         self.pauseondelay = 2  # time between pause sensor actuation and actual pause
         self.pauseoffdelay = 1  # time between end of pause sensor actuation and end of actual pause
         self.forcedduration = 60  # time in minutes for the forced mode
+        self.minusefulheat = 0  # minimum useful heat duration in minutes (0 = disabled)
         self.ActiveSensors = {}
         self.InTempSensors = []
         self.OutTempSensors = []
@@ -325,6 +338,23 @@ class BasePlugin:
                 self.WriteLog("Valve contact sensor idx = {}".format(self.valveidx), "Verbose")
             else:
                 self.WriteLog("Valve contact sensor: disabled", "Verbose")
+            # read optional minimum useful heat duration (8th value in Mode5)
+            if len(rawparams) > 7:
+                try:
+                    self.minusefulheat = int(rawparams[7])
+                except ValueError:
+                    self.minusefulheat = 0
+            else:
+                self.minusefulheat = 0
+            maxusefulheat = self.calculate_period // 2
+            if self.minusefulheat > maxusefulheat:
+                Domoticz.Error("Min useful heat duration ({}) exceeds maximum allowed ({}). Clamping.".format(
+                    self.minusefulheat, maxusefulheat))
+                self.minusefulheat = maxusefulheat
+            if self.minusefulheat > 0:
+                self.WriteLog("Minimum useful heat duration = {} minutes".format(self.minusefulheat), "Verbose")
+            else:
+                self.WriteLog("Minimum useful heat duration: disabled", "Verbose")
         else:
             Domoticz.Error("Error reading Mode5 parameters")
 
@@ -590,6 +620,16 @@ class BasePlugin:
         heatduration = round(power * self.calculate_period / 100)
         self.WriteLog("Calculation: Power = {} -> heat duration = {} minutes".format(power, heatduration), "Verbose")
 
+        # [FIX] treat heatduration==0 as no heating (avoids opening valve for 0 useful minutes)
+        # [NEW] also skip if heatduration < minusefulheat (avoids pointless short cycles)
+        if heatduration == 0 and power > 0:
+            self.WriteLog("Skipping: heat duration is 0 minutes (power={})".format(power), "Verbose")
+            power = 0
+        elif self.minusefulheat > 0 and 0 < heatduration < self.minusefulheat:
+            self.WriteLog("Skipping: heat duration {} min is below minimum useful {} min".format(
+                heatduration, self.minusefulheat), "Status")
+            power = 0
+
         if power == 0:
             self.switchHeat(False)
             self.heatduration_pending = 0
@@ -644,6 +684,13 @@ class BasePlugin:
         elif self.Internals['LastPwr'] == 0:  # heater was off last time, do nothing
             self.WriteLog("Last power was zero... no calibration", "Verbose")
             pass
+        elif self.intemp > self.Internals['LastSetPoint'] and self.Internals['LastPwr'] > 0:
+            # [FIX] overshoot detected: temperature exceeded setpoint after a heating cycle.
+            # This means ConstC calculated too much power regardless of its absolute value.
+            # Force ConstC down by 15% per cycle until overshoot stops.
+            self.Internals['ConstC'] = round(self.Internals['ConstC'] * 0.85, 1)
+            self.WriteLog("Overshoot detected (intemp={} > LastSetPoint={}) - forcing ConstC down to {}".format(
+                self.intemp, self.Internals['LastSetPoint'], self.Internals['ConstC']), "Status")
         elif self.Internals['LastPwr'] == 100 and self.intemp < self.Internals['LastSetPoint']:
             # heater was on max and setpoint was NOT reached: no learning, but
             # [FIX] if ConstC is already very high, it means it is diverging - force it down gradually
